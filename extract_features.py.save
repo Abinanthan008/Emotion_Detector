@@ -1,0 +1,68 @@
+import os
+import glob
+import numpy as np
+import torch
+import librosa
+from transformers import HubertModel, Wav2Vec2Processor
+from tqdm import tqdm
+
+# ==========================================
+# 1. CONFIGURATION & PATHS
+# ==========================================
+AUDIO_DIR = "/home/abi/audio_proj/Audio_Speech_Actors_01-24" # Change this to your raw WAV folder path
+OUTPUT_DIR = "/home/abi/audio_proj/extracted_features"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+TARGET_SR = 16000
+MAX_FRAMES = 199  # Matches the [199, 768] classifier requirement
+
+# ==========================================
+# 2. INITIALIZE HUBERT
+# ==========================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Extracting features using device: {device}")
+
+processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-base-ls960")
+model = HubertModel.from_pretrained("facebook/hubert-base-ls960").to(device)
+model.eval()
+
+# Find all raw WAV files recursively
+wav_files = glob.glob(os.path.join(AUDIO_DIR, "**/*.wav"), recursive=True)
+if not wav_files:
+    print(f"[WARNING] No .wav files found in {AUDIO_DIR}. Check your path structure!")
+
+# ==========================================
+# 3. EXTRACTION LOOP
+# ==========================================
+for wav_path in tqdm(wav_files, desc="Extracting HuBERT Middle-Layer Features"):
+    try:
+        # Load and normalize raw audio amplitude
+        speech, sr = librosa.load(wav_path, sr=TARGET_SR)
+        speech = librosa.util.normalize(speech)        input_values = processor(speech, return_tensors="pt", sampling_rate=TARGET_SR).input_values.to(device)
+       
+        with torch.no_grad():
+            # Request all hidden states output
+            outputs = model(input_values, output_hidden_states=True)
+            
+            # Extract Layer 7 (Index 7) - The Acoustic/Prosody Sweet Spot for Emotion
+            # Structure: outputs.hidden_states is a tuple of 13 layers (0 to 12)
+            layer_features = outputs.hidden_states[7].squeeze(0).cpu().numpy()
+            
+        # Standardize timeline mapping to exactly 199 frames
+        num_frames = layer_features.shape[0]
+        if num_frames >= MAX_FRAMES:
+            # Truncate
+            final_features = layer_features[:MAX_FRAMES, :]
+        else:
+            # Pad with zeros
+            pad_width = MAX_FRAMES - num_frames
+            final_features = np.pad(layer_features, ((0, pad_width), (0, 0)), mode='constant')
+            
+        # Save feature matrix named exactly like original audio file
+        base_name = os.path.basename(wav_path).replace(".wav", ".npy")
+        np.save(os.path.join(OUTPUT_DIR, base_name), final_features)
+        
+    except Exception as e:
+        print(f"\n[ERROR] Failed to process {wav_path}: {e}")
+
+print(f"\n[SUCCESS] All features extracted successfully into: {OUTPUT_DIR}")
